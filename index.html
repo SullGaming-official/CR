@@ -30,9 +30,9 @@ label{display:block;font-size:14px;margin:6px 0}
 <script src="https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js"></script>
 <script>
 const $=id=>document.getElementById(id);
-const cv=$('c'),gl=cv.getContext('webgl2',{antialias:true});
+const cv=$('c'),gl=cv.getContext('webgl2',{antialias:false,alpha:false,depth:false,stencil:false,desynchronized:true,powerPreference:'high-performance'});
 let W=1,H=1;
-function rs(){const d=Math.min(devicePixelRatio||1,2);W=cv.width=Math.round(innerWidth*d);H=cv.height=Math.round(innerHeight*d)}
+function rs(){const d=Math.min(devicePixelRatio||1,3);W=cv.width=Math.round(innerWidth*d);H=cv.height=Math.round(innerHeight*d)}
 addEventListener('resize',rs);rs();
 if(!gl)document.body.insertAdjacentHTML('beforeend','<p style="position:fixed;top:40%;width:100%;text-align:center">This browser has no WebGL2. Try Chrome.</p>');
 
@@ -177,11 +177,12 @@ function buildHud(){
 function buildPanel(){const m=new Mesh();m.q([[-1,-.625,0],[1,-.625,0],[1,.625,0],[-1,.625,0]],hex('#ffffff'));return up(m)}
 function buildDot(){const m=new Mesh(),q=(r,z,c)=>m.q([[-r,-r,z],[r,-r,z],[r,r,z],[-r,r,z]],hex(c));q(.042,0,'#101010');q(.028,.002,'#ffffff');return up(m)}
 function mkTex(){const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
- gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);return t}
+ gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR_MIPMAP_LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);aniso(t);return t}
+function aniso(){const x=gl.getExtension('EXT_texture_filter_anisotropic');if(x)gl.texParameterf(gl.TEXTURE_2D,x.TEXTURE_MAX_ANISOTROPY_EXT,Math.min(8,gl.getParameter(x.MAX_TEXTURE_MAX_ANISOTROPY_EXT)))}
 /* ---------- GL setup ---------- */
 let prog,U={},world,sky,carM,inter,wheel,hudQ,tex,mtex,panelQ,dotQ;
-const hc=document.createElement('canvas');hc.width=256;hc.height=128;const hx=hc.getContext('2d');
-const mc=document.createElement('canvas');mc.width=1024;mc.height=640;const mx=mc.getContext('2d');
+const hc=document.createElement('canvas');hc.width=512;hc.height=256;const hx=hc.getContext('2d');hx.scale(2,2);
+const mc=document.createElement('canvas');mc.width=1536;mc.height=960;const mx=mc.getContext('2d');mx.scale(1.5,1.5);
 function initGL(){
  const vs=`#version 300 es
  in vec3 aP;in vec4 aC;uniform mat4 uP,uV,uM;uniform vec4 uUV;out vec4 vC;out vec3 vV;out vec2 vU;
@@ -201,9 +202,53 @@ function initGL(){
  ['uP','uV','uM','uUV','uTint','uLight','uFog','uLit','uFogOn','uTex','uS'].forEach(n=>U[n]=gl.getUniformLocation(prog,n));
  gl.enableVertexAttribArray(0);gl.enableVertexAttribArray(1);gl.enable(gl.SCISSOR_TEST);
  world=buildWorld();sky=buildSky();carM=buildCar();inter=buildInterior();wheel=buildWheel();hudQ=buildHud();panelQ=buildPanel();dotQ=buildDot();mtex=mkTex();
- tex=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,tex);
- gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+ tex=mkTex();initDistort();
  gl.uniform1i(U.uS,0);gl.uniform3f(U.uFog,.949,.698,.478);
+}
+
+/* ---------- Cardboard lens distortion + MSAA offscreen render ---------- */
+const CB={k1:.34,k2:.55,ty:1.35,ipdShift:0};   /* Cardboard v2 lens coefficients; ty = tan(half vertical FOV) of the render */
+let dProg,dU={},dVAO,eyeT=[],eyeFB=[],msFB=null,msRB=null,msDB=null,tW=0,tH=0;
+function initDistort(){
+ const vs=`#version 300 es
+ const vec2 q[4]=vec2[4](vec2(-1,-1),vec2(1,-1),vec2(-1,1),vec2(1,1));
+ out vec2 vP;void main(){vec2 p=q[gl_VertexID];vP=p;gl_Position=vec4(p,0,1);}`;
+ const fs=`#version 300 es
+ precision highp float;in vec2 vP;uniform sampler2D uT;uniform vec2 uK;uniform vec2 uAsp;uniform float uTy;out vec4 o;
+ void main(){
+  vec2 t=vP*uAsp*.8;                       /* screen position in lens tan-angle units */
+  float r2=dot(t,t);
+  vec2 u=t*(1.+uK.x*r2+uK.y*r2*r2);        /* undistorted direction the lens sends to this pixel */
+  vec2 uv=vec2(u.x/(uTy*uAsp.x/uAsp.y),u.y/uTy)*.5+.5;
+  if(uv.x<0.||uv.x>1.||uv.y<0.||uv.y>1.){o=vec4(0,0,0,1);return;}
+  o=vec4(texture(uT,uv).rgb,1.);}`;
+ const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);if(!gl.getShaderParameter(o,gl.COMPILE_STATUS))console.error(gl.getShaderInfoLog(o));return o};
+ dProg=gl.createProgram();gl.attachShader(dProg,sh(gl.VERTEX_SHADER,vs));gl.attachShader(dProg,sh(gl.FRAGMENT_SHADER,fs));gl.linkProgram(dProg);
+ ['uT','uK','uAsp','uTy'].forEach(n=>dU[n]=gl.getUniformLocation(dProg,n));
+ dVAO=gl.createVertexArray();
+}
+function ensureTargets(w,h){
+ if(w===tW&&h===tH&&msFB)return;
+ tW=w;tH=h;
+ for(const x of eyeT)gl.deleteTexture(x);for(const x of eyeFB)gl.deleteFramebuffer(x);
+ if(msFB){gl.deleteFramebuffer(msFB);gl.deleteRenderbuffer(msRB);gl.deleteRenderbuffer(msDB)}
+ eyeT=[];eyeFB=[];
+ const ms=Math.min(4,gl.getParameter(gl.MAX_SAMPLES)||1);
+ msFB=gl.createFramebuffer();msRB=gl.createRenderbuffer();msDB=gl.createRenderbuffer();
+ gl.bindRenderbuffer(gl.RENDERBUFFER,msRB);gl.renderbufferStorageMultisample(gl.RENDERBUFFER,ms,gl.RGBA8,w,h);
+ gl.bindRenderbuffer(gl.RENDERBUFFER,msDB);gl.renderbufferStorageMultisample(gl.RENDERBUFFER,ms,gl.DEPTH_COMPONENT24,w,h);
+ gl.bindFramebuffer(gl.FRAMEBUFFER,msFB);
+ gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.RENDERBUFFER,msRB);
+ gl.framebufferRenderbuffer(gl.FRAMEBUFFER,gl.DEPTH_ATTACHMENT,gl.RENDERBUFFER,msDB);
+ for(let e=0;e<2;e++){
+  const t=gl.createTexture();gl.bindTexture(gl.TEXTURE_2D,t);
+  gl.texStorage2D(gl.TEXTURE_2D,1,gl.RGBA8,w,h);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MIN_FILTER,gl.LINEAR);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_MAG_FILTER,gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_S,gl.CLAMP_TO_EDGE);gl.texParameteri(gl.TEXTURE_2D,gl.TEXTURE_WRAP_T,gl.CLAMP_TO_EDGE);
+  const f=gl.createFramebuffer();gl.bindFramebuffer(gl.FRAMEBUFFER,f);gl.framebufferTexture2D(gl.FRAMEBUFFER,gl.COLOR_ATTACHMENT0,gl.TEXTURE_2D,t,0);
+  eyeT.push(t);eyeFB.push(f);
+ }
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);
 }
 if(gl)initGL();
 
@@ -385,7 +430,7 @@ function drawMenu(){
  mx.fillStyle=lookOn&&!tracking()?'#ffb4a2':'#8fb2b8';mx.font='22px '+FF;
  mx.fillText(!lookOn?'Head look is off':tracking()?'Head tracking is on':'No gyro data yet. Move your phone, and open this file in Chrome.',512,560);
  mx.fillStyle='#8fb2b8';mx.fillText(padOn?'Look at a button and press A':'Press a button on your controller to connect it',512,626);
- gl.bindTexture(gl.TEXTURE_2D,mtex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,mc);
+ gl.bindTexture(gl.TEXTURE_2D,mtex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,mc);gl.generateMipmap(gl.TEXTURE_2D);
 }
 function menuStep(dt){
  let a=false,sx=0,sy=0;padOn=false;
@@ -452,7 +497,7 @@ function drawHud(){
  hx.fillStyle='#ffd9a0';hx.font='bold 62px sans-serif';hx.fillText(Math.round(me.v*3.6),128,66);
  hx.fillStyle='#f4e9d8';hx.font='bold 18px sans-serif';hx.fillText('km/h',128,88);
  hx.font='bold 24px sans-serif';hx.fillText('Lap '+(me.laps+1)+'   Place '+place+'/'+total,128,118);
- gl.bindTexture(gl.TEXTURE_2D,tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,hc);
+ gl.bindTexture(gl.TEXTURE_2D,tex);gl.texImage2D(gl.TEXTURE_2D,0,gl.RGBA,gl.RGBA,gl.UNSIGNED_BYTE,hc);gl.generateMipmap(gl.TEXTURE_2D);
 }
 
 /* ---------- render ---------- */
@@ -463,13 +508,14 @@ const col3=s=>hex(s).slice(0,3);
 const wheelM=()=>mat.mul(mat.T(0,.9,-.35),mat.mul(mat.Rx(-.44),mat.Rz(-me.steer*1.4)));
 const hudM=()=>mat.mul(mat.T(-.42,.93,-.62),mat.mul(mat.Ry(.55),mat.Rx(-.3)));
 function render(){
- gl.disable(gl.SCISSOR_TEST);gl.clearColor(0,0,0,1);gl.clear(gl.COLOR_BUFFER_BIT);gl.enable(gl.SCISSOR_TEST);
- const w=W>>1,h=H,Rt=mat.tr(headRot()),proj=mat.P(1.57,w/h,.15,3000);
+ const w=W>>1,h=H;ensureTargets(w,h);
+ gl.disable(gl.SCISSOR_TEST);gl.useProgram(prog);
+ const Rt=mat.tr(headRot()),Ty=CB.ty,Tx=Ty*w/h,proj=(()=>{const m=new Float32Array(16),n=.15,f=3000;m[0]=1/Tx;m[5]=1/Ty;m[10]=(f+n)/(n-f);m[11]=-1;m[14]=2*f*n/(n-f);return m})();
  const here=pose(me.u,me.d);
  const carInv=mat.mul(mat.Rx(-here.pitch),mat.mul(mat.Ry(me.psi),mat.T(-me.x,-here.y,-me.z)));
  const head=mat.T(-0,-1.12,-.25);
  for(let e=0;e<2;e++){
-  gl.viewport(e*w,0,w,h);gl.scissor(e*w,0,w,h);
+  gl.bindFramebuffer(gl.FRAMEBUFFER,msFB);gl.viewport(0,0,w,h);gl.enable(gl.DEPTH_TEST);gl.depthMask(true);
   gl.clearColor(.95,.7,.48,1);gl.clear(gl.COLOR_BUFFER_BIT|gl.DEPTH_BUFFER_BIT);
   gl.uniformMatrix4fv(U.uP,false,proj);gl.uniform1f(U.uTex,0);gl.uniform4f(U.uUV,1,1,0,0);
   const eyeV=mat.T(e?-.032:.032,0,0),Vh=mat.mul(eyeV,mat.mul(Rt,head)),Vw=mat.mul(Vh,carInv);
@@ -498,7 +544,20 @@ function render(){
    else if(ptr){gl.uniformMatrix4fv(U.uM,false,mat.T((cu/1024-.5)*2,1.25-(cvv/640-.5)*1.25,-1.97));draw(dotQ)}
    gl.enable(gl.DEPTH_TEST);
   }
+  /* resolve MSAA into this eye's texture */
+  gl.bindFramebuffer(gl.READ_FRAMEBUFFER,msFB);gl.bindFramebuffer(gl.DRAW_FRAMEBUFFER,eyeFB[e]);
+  gl.blitFramebuffer(0,0,w,h,0,0,w,h,gl.COLOR_BUFFER_BIT,gl.NEAREST);
  }
+ /* barrel-distort each eye onto the screen to cancel the Cardboard lens pincushion */
+ gl.bindFramebuffer(gl.FRAMEBUFFER,null);gl.disable(gl.DEPTH_TEST);gl.useProgram(dProg);gl.bindVertexArray(dVAO);
+ gl.uniform2f(dU.uK,CB.k1,CB.k2);gl.uniform2f(dU.uAsp,w/h,1);gl.uniform1f(dU.uTy,Ty);gl.uniform1i(dU.uT,1);
+ gl.enable(gl.SCISSOR_TEST);
+ for(let e=0;e<2;e++){
+  gl.viewport(e*w,0,w,h);gl.scissor(e*w,0,w,h);
+  gl.activeTexture(gl.TEXTURE1);gl.bindTexture(gl.TEXTURE_2D,eyeT[e]);
+  gl.drawArrays(gl.TRIANGLE_STRIP,0,4);
+ }
+ gl.activeTexture(gl.TEXTURE0);gl.bindVertexArray(null);gl.disable(gl.SCISSOR_TEST);gl.useProgram(prog);gl.enable(gl.DEPTH_TEST);
 }
 let last=performance.now();
 function frame(t){
